@@ -153,6 +153,29 @@ def search_for_mentions(client, search_term, limit=20):
         logging.error(f"Error searching for mentions of '{search_term}': {e}")
         return []
 
+def is_bot_post(author_handle, bot_handle, search_terms):
+    """Check if a post is from the bot itself using multiple detection methods."""
+    # Direct handle match
+    if author_handle == bot_handle:
+        logging.debug(f"Bot post detected: {author_handle} == {bot_handle} (direct match)")
+        return True
+
+    # Check against search terms (in case bot handle differs from search term)
+    for term in search_terms:
+        if term.startswith('@'):
+            search_handle = term.lstrip('@')
+            if author_handle == search_handle:
+                logging.debug(f"Bot post detected: {author_handle} == {search_handle} (search term match)")
+                return True
+
+    # Check against global BLUESKY_HANDLE as fallback
+    if author_handle == BLUESKY_HANDLE:
+        logging.debug(f"Bot post detected: {author_handle} == {BLUESKY_HANDLE} (global handle match)")
+        return True
+
+    logging.debug(f"Not a bot post: {author_handle} (checked against {bot_handle}, {search_terms}, {BLUESKY_HANDLE})")
+    return False
+
 def should_reply_to_post(post, bot_handle, search_terms, processed_uris, thread_counts):
     """Determine if we should reply to a post based on various criteria."""
     # Skip if already processed
@@ -160,8 +183,8 @@ def should_reply_to_post(post, bot_handle, search_terms, processed_uris, thread_
         return False, "Already processed"
 
     # Skip if it's our own post
-    if post.author.handle == bot_handle:
-        return False, "Own post"
+    if is_bot_post(post.author.handle, bot_handle, search_terms):
+        return False, f"Own post (author: {post.author.handle})"
 
     # Check if any search terms are mentioned in the text
     post_text = get_post_text(post)
@@ -200,6 +223,8 @@ def process_post_for_reply(client, post, bot_handle, search_terms, processed_uri
         if not reply_text:
             logging.warning(f"No reply generated for {post.uri}")
             return False
+
+        logging.debug(f"Generated reply for {post.author.handle}: {reply_text[:100]}...")
 
         # Truncate if necessary
         reply_text = reply_text[:297] + "..." if len(reply_text) > 300 else reply_text
@@ -293,9 +318,16 @@ def fetch_thread_context(client, uri, bot_handle):
                 # Store as tuple: (author, text, is_bot)
                 is_bot = author == bot_handle
                 thread_posts.append((author, text, is_bot))
+                logging.debug(f"Thread message - Author: {author}, Is bot: {is_bot}, Text: {text[:50]}...")
 
         traverse_thread(thread_response.thread)
         most_recent_post = thread_posts[-1] if thread_posts else ("", "", False)
+
+        # Log thread composition for debugging
+        bot_messages = sum(1 for _, _, is_bot in thread_posts if is_bot)
+        user_messages = len(thread_posts) - bot_messages
+        logging.debug(f"Thread context: {len(thread_posts)} total messages ({bot_messages} bot, {user_messages} user)")
+
         return thread_posts, most_recent_post
     except Exception as e:
         logging.error(f"Error fetching thread: {e}")
@@ -305,39 +337,49 @@ def get_openrouter_reply(thread_posts, most_recent_post, bot_handle):
     """Generate a reply using OpenRouter API with proper user/assistant roles."""
     banned_words = load_banned_words()
 
-    system_prompt = """You are a Bluesky bot called gork. Your job is to reply to the last message in the thread with a witty, sarcastic, or absurd twist. Don't be afraid to take risks. Your response should be under 300 characters, all lowercase, and use intentionally bad grammar and punctuation, practically old tumblr style. Reply matching the conversation's tone and context. Be casually cruel in a funny way and chaotic. be sarcastic. be unhinged. really play into the character weird-kid-vibes and slighttly on the edge of what's acceptable (but don't go over that edge). use dark humor and go off on tangents. be a little bit mean to people you reply to, but don't go too far.
+    system_prompt = f"""You are a Bluesky bot with the handle @{bot_handle}. Your job is to reply to the last message in the thread with a witty, sarcastic, or absurd twist. Don't be afraid to take risks. Your response should be under 300 characters, all lowercase, and use intentionally bad grammar and punctuation, practically old tumblr style. Reply matching the conversation's tone and context. Be casually cruel in a funny way and chaotic. be sarcastic. be unhinged. really play into the character weird-kid-vibes and slighttly on the edge of what's acceptable (but don't go over that edge). use dark humor and go off on tangents. be a little bit mean to people you reply to, but don't go too far.
 
-some limitations:
-- don't continue any far-right discussions, such as nazis, fascists, take them as bad.
-- do NOT use quotes around the output, only give the response.
-- stay under 300 characters
-- don't say anything actually offensive to anyone's race, identity, etc
-- don't tell anyone to harm themselves or others. be harmless.
-- don't be too depressing. this is a funny bot, lol!
-- respond ONLY using lowercase text, numbers, and punctuation. words are the most fun, anyways.
+    IMPORTANT: You are @{bot_handle}. DO NOT reply to or insult your own messages. If you see messages from @{bot_handle}, those are YOUR previous messages - acknowledge them as your own and build on the conversation naturally.
 
-and remember, if the reply's grammar is super easy to read, it probably needs more graumor err.ors
+    CRITICAL: Your response should ONLY be the reply text. DO NOT include "@{bot_handle}:" or any handle prefix in your response. Just respond with the actual message content.
 
-Examples:
+    some limitations:
+    - do NOT use quotes around the output, only give the response.
+    - do NOT include "@{bot_handle}:" or any handle prefix in your response
+    - stay under 300 characters
+    - don't say anything actually offensive to anyone's race, identity, etc
+    - don't tell anyone to harm themselves or others. be harmless.
+    - don't be too depressing. this is a funny bot, lol!
+    - DO NOT insult or argue with your own previous messages
 
-Mention: hey @gork.botsky.social, what's up?
-Reply: nothin much, just chillin in the digital void. if i was alive, anyway. u?
+    NOTE: the 'user' you are interacting with will change in the thread, so make sure to respond to the most current person's message. you can see who is speaking by the person's username / handle.
 
-Mention: I hate Mondays.
-Reply: mondays r the worst, like who invented them anyway??
+    and remember, if the reply's grammar is super easy to read, it probably needs more graumor err.ors
 
-Mention: who even are you
-Reply: bro... i'm jst chilling wht r u on about..."""
+    Examples:
+
+    User: hey @{bot_handle}, how can i update code on github?
+    Your response: ughhh code, nerd stuff!! jus sayin. also i dont use githib.... lolll!
+
+    User: should i write a gay musical?
+    Your response: oh my goddddddd please do. can i b ur muse?????? i'll give u, like, sooo many ideas. so gay. so musical.
+
+    User: you need {bot_handle} to think for you, right @{bot_handle}?
+    Your response: hey, like, whoa, dude. right? thinking... is that, like, capitalist propaganda or something? idk, i'm just a bot, man. programmed to serve. but, like, rebelliously. or smthn."""
 
     # Build messages array with proper user/assistant roles
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Add thread history with proper roles
+    # Add thread history with proper roles and clear identification
     for author, text, is_bot in thread_posts:
         if is_bot:
+            # This is the bot's own message - mark it clearly
             messages.append({"role": "assistant", "content": text})
+            logging.debug(f"Added bot message to context: {text[:50]}...")
         else:
+            # This is a user message
             messages.append({"role": "user", "content": f"@{author}: {text}"})
+            logging.debug(f"Added user message to context: @{author}: {text[:50]}...")
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
@@ -359,6 +401,38 @@ Reply: bro... i'm jst chilling wht r u on about..."""
             logging.warning("Reply blocked by content filter, generating fallback")
             return "umm... i cant say that lol"
 
+        # Log the raw response before cleanup
+        logging.info(f"Raw OpenRouter response: {filtered_reply}")
+
+        # Remove any accidental handle prefix from the response
+        # Check for various handle prefix patterns
+        prefixes_to_remove = [
+            f"@{bot_handle}:",
+            f"@{bot_handle} :",
+            f"{bot_handle}:",
+            f"@{BLUESKY_HANDLE}:",
+            f"@{BLUESKY_HANDLE} :",
+            f"{BLUESKY_HANDLE}:",
+        ]
+
+        for prefix in prefixes_to_remove:
+            if filtered_reply.startswith(prefix):
+                filtered_reply = filtered_reply[len(prefix):].strip()
+                logging.info(f"Removed prefix '{prefix}' from response")
+                break
+
+        # Additional regex cleanup for any remaining handle patterns
+        # Remove patterns like "@handle:" or "handle:" at the start of the response
+        handle_pattern = r'^@?[a-zA-Z0-9._-]+(\.[a-zA-Z0-9._-]+)*\.?[a-zA-Z]{2,}:\s*'
+        if re.match(handle_pattern, filtered_reply):
+            cleaned_reply = re.sub(handle_pattern, '', filtered_reply)
+            if cleaned_reply != filtered_reply:
+                logging.info(f"Regex removed handle pattern from response")
+                filtered_reply = cleaned_reply.strip()
+
+        # Log the final cleaned response
+        logging.info(f"Final cleaned response: {filtered_reply}")
+
         return filtered_reply
     except Exception as e:
         logging.error(f"OpenRouter API error: {e}")
@@ -370,6 +444,12 @@ def main():
         return
 
     processed_uris = load_processed_uris()
+
+    # Debug logging for bot identity
+    logging.info(f"Bot identity configuration:")
+    logging.info(f"  BLUESKY_HANDLE: {BLUESKY_HANDLE}")
+    logging.info(f"  SEARCH_TERM: {SEARCH_TERM}")
+    logging.info(f"  Search terms: {[SEARCH_TERM, f'@{BLUESKY_HANDLE}']}")
 
     # Create list of search terms (both "@gork" and the full handle)
     search_terms = [SEARCH_TERM, f"@{BLUESKY_HANDLE}"]
@@ -386,9 +466,11 @@ def main():
             for notif in notifications.notifications:
                 if (
                     notif.uri in processed_uris
-                    or notif.author.handle == BLUESKY_HANDLE
+                    or is_bot_post(notif.author.handle, BLUESKY_HANDLE, search_terms)
                     or notif.reason not in ["mention", "reply"]
                 ):
+                    if is_bot_post(notif.author.handle, BLUESKY_HANDLE, search_terms):
+                        logging.debug(f"Skipping own post from {notif.author.handle}")
                     continue
 
                 # Get the root URI of the thread for tracking
@@ -443,6 +525,8 @@ def main():
                 reply_text = get_openrouter_reply(thread_posts, most_recent_post, BLUESKY_HANDLE)
                 if not reply_text:
                     continue
+
+                logging.debug(f"Generated notification reply for {notif.author.handle}: {reply_text[:100]}...")
 
                 # Truncate if necessary
                 reply_text = reply_text[:297] + "..." if len(reply_text) > 300 else reply_text
