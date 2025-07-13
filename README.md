@@ -8,7 +8,7 @@ Amazing prompt written by [Elliot](https://ellioth.co)!
 ## Features
 
 * **Responds to all mentions and replies** on Bluesky (via notifications)
-* **Uses Google Gemini 2.0** for all AI-powered text responses
+* **Uses Google Gemini 2.0 Flash Lite** for all AI-powered text responses
 * **Thread-aware**: Replies with context of the entire conversation
 * **Persistent cache**: Prevents duplicate replies (even if restarted)
 
@@ -35,7 +35,7 @@ Amazing prompt written by [Elliot](https://ellioth.co)!
 4. **Run the bot**:
 
    ```
-   python grokbot.py
+   python bot.py
    ```
 
 ## How It Works
