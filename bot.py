@@ -13,6 +13,17 @@ from atproto_client.models.app.bsky.notification.list_notifications import (
 from atproto_client.models.app.bsky.feed.get_post_thread import (
     Params as GetPostThreadParams,
 )
+from atproto_client.models.app.bsky.feed.search_posts import (
+    Params as SearchPostsParams,
+)
+
+# ----------- Configuration -----------
+# Set this to True to reply to ALL posts mentioning @gork across Bluesky
+# Set to False to only reply to direct notifications (mentions/replies to your bot)
+REPLY_TO_ALL_MENTIONS = True  # Comment out this line or set to False to disable
+
+# What to search for in posts (the mention text)
+SEARCH_TERM = "@gork"  # This is what we'll search for across Bluesky
 
 # ----------- Persistent cache files -----------
 PROCESSED_URIS_FILE = "processed_uris.txt"
@@ -64,9 +75,118 @@ def get_thread_root_uri(client, uri):
         logging.error(f"Error finding thread root: {e}")
         return uri  # Fallback to current URI
 
-def is_bot_mentioned_in_text(text, bot_handle):
-    """Check if the bot is specifically mentioned in the text."""
-    return f"@{bot_handle}" in text.lower()
+def is_bot_mentioned_in_text(text, search_terms):
+    """Check if any of the search terms are mentioned in the text."""
+    text_lower = text.lower()
+    # Check both the search term and the full bot handle
+    if isinstance(search_terms, str):
+        search_terms = [search_terms]
+    
+    for term in search_terms:
+        if term.lower() in text_lower:
+            return True
+    return False
+
+def search_for_mentions(client, search_term, limit=20):
+    """Search for posts mentioning the specified term across Bluesky."""
+    try:
+        params = SearchPostsParams(
+            q=search_term,
+            limit=limit,
+            sort="latest"
+        )
+        search_response = client.app.bsky.feed.search_posts(params=params)
+        logging.info(f"Search for '{search_term}' returned {len(search_response.posts)} results")
+        return search_response.posts
+    except Exception as e:
+        logging.error(f"Error searching for mentions of '{search_term}': {e}")
+        return []
+
+def should_reply_to_post(post, bot_handle, search_terms, processed_uris, thread_counts):
+    """Determine if we should reply to a post based on various criteria."""
+    # Skip if already processed
+    if post.uri in processed_uris:
+        return False, "Already processed"
+    
+    # Skip if it's our own post
+    if post.author.handle == bot_handle:
+        return False, "Own post"
+    
+    # Check if any search terms are mentioned in the text
+    post_text = get_post_text(post)
+    if not is_bot_mentioned_in_text(post_text, search_terms):
+        return False, "Search terms not mentioned"
+    
+    # Check thread reply limits
+    thread_root_uri = post.uri  # For search results, treat each post as its own thread root
+    current_count = thread_counts.get(thread_root_uri, 0)
+    
+    if current_count >= MAX_REPLIES_PER_THREAD:
+        return False, f"Thread limit reached ({current_count}/{MAX_REPLIES_PER_THREAD})"
+    
+    return True, "Should reply"
+
+def process_post_for_reply(client, post, bot_handle, search_terms, processed_uris, thread_counts):
+    """Process a single post and reply if appropriate."""
+    try:
+        # Check if we should reply
+        should_reply, reason = should_reply_to_post(post, bot_handle, search_terms, processed_uris, thread_counts)
+        
+        if not should_reply:
+            logging.debug(f"Skipping post {post.uri}: {reason}")
+            return False
+        
+        # Get thread context
+        thread_history, most_recent_post = fetch_thread_context(client, post.uri)
+        if not most_recent_post:
+            # If we can't get thread context, use the post itself
+            post_text = get_post_text(post)
+            most_recent_post = f"@{post.author.handle}: {post_text}"
+            thread_history = most_recent_post
+        
+        # Generate reply
+        reply_text = get_openrouter_reply(thread_history, most_recent_post)
+        if not reply_text:
+            logging.warning(f"No reply generated for {post.uri}")
+            return False
+        
+        # Truncate if necessary
+        reply_text = reply_text[:297] + "..." if len(reply_text) > 300 else reply_text
+        
+        # Create reply reference
+        parent_ref = models.ComAtprotoRepoStrongRef.Main(
+            cid=post.cid, uri=post.uri
+        )
+        root_ref = parent_ref
+        
+        # If this post is a reply to something else, we need to find the root
+        if hasattr(post.record, "reply") and post.record.reply:
+            root_ref = post.record.reply.root
+        
+        # Send the reply
+        client.send_post(
+            text=reply_text,
+            reply_to=models.AppBskyFeedPost.ReplyRef(
+                root=root_ref, parent=parent_ref
+            ),
+        )
+        
+        # Update tracking
+        processed_uris.add(post.uri)
+        append_processed_uri(post.uri)
+        
+        # Update thread count
+        thread_root_uri = get_thread_root_uri(client, post.uri)
+        current_count = thread_counts.get(thread_root_uri, 0)
+        thread_counts[thread_root_uri] = current_count + 1
+        save_thread_replies(thread_counts)
+        
+        logging.info(f"Replied to search result {post.uri} with: {reply_text[:50]}... (Thread count: {thread_counts[thread_root_uri]})")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error processing post {post.uri}: {e}")
+        return False
 
 # ------------------------------------------------------------------------
 
@@ -80,6 +200,7 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 GPT_MODEL = "google/gemini-2.0-flash-001"
 MENTION_CHECK_INTERVAL_SECONDS = 30
 NOTIFICATION_FETCH_LIMIT = 30
+SEARCH_LIMIT = 20  # How many search results to process each cycle
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -131,6 +252,7 @@ def get_openrouter_reply(thread_history, most_recent_post):
     prompt = f"""You are a Bluesky bot called gork. Your job is to reply to the last message in the thread with a witty, sarcastic, or absurd twist. Don't be afraid to take risks. Your response should be under 300 characters, all lowercase, and use intentionally bad grammar and punctuation, practically old tumblr style. Reply matching the conversation's tone and context. Be casually cruel in a funny way and chaotic. be sarcastic. be unhinged. really play into the character weird-kid-vibes and slighttly on the edge of what's acceptable (but don't go over that edge). use dark humor and go off on tangents. be a little bit mean to people you reply to, but don't go too far.
 
 some limitations:
+- don't continue any far-right discussions, such as nazis, fascists, take them as bad.
 - do NOT use quotes around the output, only give the response.
 - stay under 300 characters
 - don't say anything actually offensive to anyone's race, identity, etc
@@ -182,12 +304,16 @@ def main():
         return
 
     processed_uris = load_processed_uris()
+    
+    # Create list of search terms (both "@gork" and the full handle)
+    search_terms = [SEARCH_TERM, f"@{BLUESKY_HANDLE}"]
 
     while True:
         try:
             # Load thread reply counts at the beginning of each loop
             thread_counts = load_thread_replies()
             
+            # Process notifications (existing functionality)
             params = ListNotificationsParams(limit=NOTIFICATION_FETCH_LIMIT)
             notifications = client.app.bsky.notification.list_notifications(params=params)
 
@@ -216,7 +342,7 @@ def main():
                     logging.error(f"Error getting post text: {e}")
 
                 # Check if bot is explicitly mentioned in this specific post
-                is_explicitly_mentioned = is_bot_mentioned_in_text(current_post_text, BLUESKY_HANDLE)
+                is_explicitly_mentioned = is_bot_mentioned_in_text(current_post_text, search_terms)
                 
                 # Get current reply count for this thread
                 current_count = thread_counts.get(thread_root_uri, 0)
@@ -279,7 +405,25 @@ def main():
                 thread_counts[thread_root_uri] = current_count + 1
                 save_thread_replies(thread_counts)
                 
-                logging.info(f"Replied to {notif.uri} with: {reply_text[:50]}... (Thread count: {thread_counts[thread_root_uri]})")
+                logging.info(f"Replied to notification {notif.uri} with: {reply_text[:50]}... (Thread count: {thread_counts[thread_root_uri]})")
+
+            # NEW FUNCTIONALITY: Search for mentions across all Bluesky posts
+            if REPLY_TO_ALL_MENTIONS:
+                logging.info(f"Searching for mentions of '{SEARCH_TERM}' across Bluesky...")
+                search_posts = search_for_mentions(client, SEARCH_TERM, SEARCH_LIMIT)
+                
+                replies_sent = 0
+                for post in search_posts:
+                    success = process_post_for_reply(client, post, BLUESKY_HANDLE, search_terms, processed_uris, thread_counts)
+                    if success:
+                        replies_sent += 1
+                        # Add a small delay between replies to avoid rate limiting
+                        time.sleep(2)
+                
+                if replies_sent > 0:
+                    logging.info(f"Sent {replies_sent} replies from search results")
+                else:
+                    logging.info("No new mentions found in search results")
 
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
